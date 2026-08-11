@@ -1,0 +1,10 @@
+# Run artifacts written into the working directory by evo/evolve.py.
+# Anchored to the repo root so the tracked examples/config.xml,
+# test/config.xml and xml/config.xml are unaffected.
+/config.xml
+/config_feat.txt
+/result_output.txt
+/running_time.txt
+
+# Local-only analysis notes.
+/NOTES-h5tuner-analysis.md
