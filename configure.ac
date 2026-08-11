@@ -603,7 +603,6 @@ AC_CONFIG_FILES([Makefile
                  examples/Makefile
                  lib/Makefile
                  examples/config.xml
-                 test/config.xml
-                 evo/h5evolve_sample.py])
+                 test/config.xml])
 
 AC_OUTPUT
