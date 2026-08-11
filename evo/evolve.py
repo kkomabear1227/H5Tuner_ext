@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 #
 # Copyright by The HDF Group.
 # All rights reserved.
@@ -8,347 +9,488 @@
 # source code distribution tree.  If you do not have access to this file,
 # you may request a copy from help@hdfgroup.org.
 #
+"""h5evolve -- genetic-algorithm search over H5Tuner I/O parameters.
 
-import subprocess
-import shutil
+For each candidate configuration this driver rewrites ./config.xml, relaunches
+the target application from scratch, and minimises the application's wall-clock
+runtime.  The H5Tuner shim reads ./config.xml once per H5Fcreate() call, so a
+configuration only takes effect on a fresh process -- hence one app launch per
+candidate, not one long-lived run that re-reads the file.
+
+LD_PRELOAD must already point at libautotuner.so when this script starts;
+subprocesses inherit it.
+
+    export LD_PRELOAD=/path/to/H5Tuner/lib/libautotuner.so
+    python3 evo/evolve.py --app-cmd 'mpiexec -n 32 ./my_app'
+
+Total app launches are population x generations x reps (default 15 x 40 x 5 =
+3000), so size the job accordingly.  Use --dry-run to exercise the search and
+the XML writer with a synthetic cost function and no launches at all -- it
+needs neither MPI nor HDF5.
+"""
+
+import argparse
+import datetime
+import math
 import os
 import os.path
+import random
+import signal
+import subprocess
 import sys
 import time
-import glob
-import datetime
-import signal
-from shutil import move
-import re
-
-import pyevolve
-from pyevolve import G1DList
-from pyevolve import GSimpleGA
-from pyevolve import Selectors
-from pyevolve import Statistics
-from pyevolve import DBAdapters
-from pyevolve import GAllele
-from pyevolve import Mutators
-from pyevolve import Initializators
-from pyevolve import Consts
-
-
 from xml.dom.minidom import Document
 
-NO_OF_PARAMS=5
-STRING_LEN=6
-NUM_ELITE=3
-NUM_POP=15
-NUM_GENS=40
-GLOB_COUNT=0
+# ---------------------------------------------------------------------------
+# Search settings.  Defaults reproduce the original experiment's scale.
+# ---------------------------------------------------------------------------
 
-pyevolve.logEnable()
+NUM_POP = 15                # ga.setPopulationSize(15)
+NUM_GENS = 40               # ga.setGenerations(40)
+NUM_ELITE = 3               # ga.setElitismReplacement(3)
+REPS = 5                    # measurements per candidate; fitness is min(times)
+TIMEOUT_SECONDS = 59 * 60   # per-candidate budget
+TIMEOUT_PENALTY = 10000.0   # fitness assigned when a candidate times out
 
-class Alarm(Exception):
-     pass
+CONFIG_FILENAME = 'config.xml'
+DEFAULT_APP_CMD = '$SCRATCH/h5_write'
 
-def alarm_handler(signum, frame):
-     raise Alarm
+# Output files left behind by the application, removed before each measurement
+# so a candidate never benefits from a previous run's data.
+CLEANUP_FILES = ('SDS.h5', 'sample_dataset.h5part', 'vorpalio.h5', 'prs.h5')
 
-#####################################################################################
-#
-# Tunable Parameters
-#
-#####################################################################################
+# ---------------------------------------------------------------------------
+# Tunable parameters.  One allele list per gene; the GA only ever picks values
+# from these lists, so every candidate is a legal configuration.
+# ---------------------------------------------------------------------------
 
-###################
-# Striping
-###################
+# Striping.  Default stripe_count is 1; 1 and 4 measured very badly, so they
+# are skipped.  -1 means stripe over every available OST.
+strp_fac = [4, 8, 16, 24, 32, 48, 64, 96, 128, -1]
 
-# The default value for stripe_count is 1. We are going to skip 1 and 4 because they
-# are shown to be very bad. Choosing stripe_count to be -1 means stripe over all of
-# available OSTs.
-strp_fac = [4, 8, 16, 24, 32, 48, 64, 96, 128, -1];
+# Stripe size must be a multiple of the 64KB page size.  Good sequential-I/O
+# values sit between 1MB and 4MB; the hard limits are 512KB and 4GB.
+strp_unt = [1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864,
+            134217728]
 
-# The default value for stripe_size is 1 MB. It has to be a multiple of page size(64KB).
-# A good stiripe size for seq.I/O is between 1 MB and 4 MB. The minimu is 512 KB and the
-# maximum is 4 GB.
-strp_unt = [1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728];
+# Collective buffering: number of aggregators.
+cb_nds = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256]
 
-#######################
-# Collective Buffering
-#######################
+# HDF5 alignment, as "threshold, alignment" pairs.
+alignment = ["1, 1", "0, 4096", "0, 16384", "0, 65536", "0, 262144",
+             "1024, 4096", "1024, 16384", "1024, 65536", "1024, 262144",
+             "4096, 16384", "4096, 65536", "4096, 262144", "16384, 65536",
+             "16384, 262144"]
 
-# The number of aggregators
-cb_nds = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256];
-
-# Collective buffering buffer siz
-# cb_buf_size = [4194304, 8388608, 16777216, 33554432, 67108864, 134217728];
-
-#################
-# HDF5
-#################
-# HDF5 Alignment
-# NEW, NOT FOR IPDPS: alignment = [65536, 131072, 262144, 524288, 1048576, 2097152];
-#alignment = [65535, 131070, 262140, 524280, 1048560, 2097120];
-alignment = ["1, 1", "0, 4096", "0, 16384", "0, 65536", "0, 262144", "1024, 4096", "1024, 16384", "1024, 65536", "1024, 262144", "4096, 16384", "4096, 65536", "4096, 262144", "16384, 65536", "16384, 262144"]
-
-# Data Sieving buffer size
-# PRABHAT
-#siv_buf_size = [65535, 131070, 262140, 524280, 1048560, 2097120];
+# Data sieving buffer size.  Single value, so this gene is effectively a
+# constant -- widen the list to search it.
 siv_buf_size = [536870912]
 
-#####################################################################
-# Utility files used during the evolve iterations
-#####################################################################
-result_output = open('./result_output.txt', 'w')
-config_feat_file = open('./config_feat.txt', 'w')
-running_time_file = open('./running_time.txt', 'w')
-perf_feat_filenames_file = open('./perf_feat_filenames.txt', 'w')
+ALLELES = (strp_fac, strp_unt, cb_nds, alignment, siv_buf_size)
 
-def eval_func(genome):
-   Logdir = './Logs/'
-    HOME = os.environ['PWD']
-   # set SCRATCH variable prior to execution evolve or use current directory
-   if os.getenv('SCRATCH', 0):
-       SCRATCH = os.environ['SCRATCH']
-   else:
-       # SCRATCH not defined then use PWD
-       SCRATCH = os.environ['PWD']
-       os.environ['SCRATCH'] = SCRATCH
+# Gene order, for readability at the call sites below.
+GENE_STRP_FAC, GENE_STRP_UNT, GENE_CB_NDS, GENE_ALIGN, GENE_SIV_BUF = range(5)
 
+# ---------------------------------------------------------------------------
+# Genetic algorithm.
+#
+# Replaces pyevolve (Python 2 only, unmaintained since ~2012) with a stdlib
+# implementation of the configuration the original script asked for:
+#
+#   G1DList over per-gene allele lists         -> genomes are plain tuples
+#   G1DListInitializatorAllele                 -> random_genome()
+#   G1DListMutatorAllele, rate 0.15 per gene   -> mutate()
+#   G1DListCrossoverSinglePoint, rate 0.9      -> single_point()
+#     pyevolve's G1DList default -- the original never set a crossover
+#     operator, so it inherited both the operator and GSimpleGA's 0.9 rate.
+#   GRouletteWheel                             -> roulette()
+#   setElitism(True) + setElitismReplacement(3)-> evolve()
+#   setMinimax(minimize)                       -> lower score wins throughout
+#
+# pyevolve fed roulette through its linear-scaling scheme (multiplier 1.2).
+# roulette() reproduces that selection ratio directly rather than cloning
+# pyevolve's internal scaling, so scores will not match the original runs
+# number-for-number.
+# ---------------------------------------------------------------------------
 
-   this_strp_fac = genome[0];
-   this_strp_unt = genome[1];
-   this_cb_nds = genome[2];
-   # this_cb_buf_size = genome[3]; Ruth(David's) Suggestion
-   this_cb_buf_size = genome[1];
-   #this_align = genome[4];
-   this_align_str = genome[3];
-   tmp = re.split(', ', this_align_str);
-   this_align_thresh = int(tmp[0])
-   this_align = int(tmp[1])
-
-   #this_siv_buf_size = genome[5];
-   this_siv_buf_size = genome[4];
-
-   # check to see if result's in history; if it is, use that!
-   #for line in open("result_output.txt"):
-   #   if str(this_strp_fac) + ", " + str(this_strp_unt) + ", " + str(this_cb_nds) + str(this_cb_buf_size) + ", " + str(this_align) + ", " + str(this_siv_buf_size) in line:
-   #      return float(line.split(", ")[6])
-
-   print "Evaluate Parameters config (%d, %d, %d, %d, %d, %d): " % (this_strp_fac, this_strp_unt, this_cb_nds, this_align_thresh, this_align, this_siv_buf_size)
-   #sys.stdout.flush()
-
-   ####################################################################
-   #
-   # Create the minidom document for tunable parameters
-   #
-   ####################################################################
-   doc = Document()
-
-   # Create the <Parameters> base element
-   params = doc.createElement("Parameters")
-   doc.appendChild(params)
-
-   high = doc.createElement("High_Level_IO_Library");
-   params.appendChild(high)
-   algn = doc.createElement("alignment");
-   high.appendChild(algn);
-   algn_txt_tmp = str(this_align_thresh) + ',' + str(this_align);
-   algn_txt = doc.createTextNode(algn_txt_tmp);
-   algn.appendChild(algn_txt);
-
-   siv_buf = doc.createElement("sieve_buf_size");
-   high.appendChild(siv_buf);
-   siv_buf_txt = doc.createTextNode(str(this_siv_buf_size));
-   siv_buf.appendChild(siv_buf_txt);
-
-   mid = doc.createElement("Middleware_Layer");
-   params.appendChild(mid);
-   cb_n = doc.createElement("cb_nodes");
-   mid.appendChild(cb_n);
-   cb_n_txt = doc.createTextNode(str(this_cb_nds));
-   cb_n.appendChild(cb_n_txt);
-
-   cb_buf = doc.createElement("cb_buffer_size");
-   mid.appendChild(cb_buf);
-   cb_buf_txt = doc.createTextNode(str(this_cb_buf_size));
-   cb_buf.appendChild(cb_buf_txt);
-
-   low = doc.createElement("Parallel_File_System");
-   params.appendChild(low);
-   strp_fac_obj = doc.createElement("striping_factor");
-   low.appendChild(strp_fac_obj);
-   strp_fac_txt = doc.createTextNode(str(this_strp_fac));
-   strp_fac_obj.appendChild(strp_fac_txt);
-
-   strp_unt_obj = doc.createElement("striping_unit");
-   low.appendChild(strp_unt_obj);
-   strp_unt_txt = doc.createTextNode(str(this_strp_unt));
-   strp_unt_obj.appendChild(strp_unt_txt);
-
-   home_dir = os.environ['PWD'];
-   file_path = home_dir + 'config.xml'
-   config_file = open(file_path, 'w');
-   config_file.write(doc.toprettyxml(indent="  "))
-   config_file.close()
-
-   ####################################################################
-   #
-   #  Application/Job Execution
-   #
-   ####################################################################
-
-   print 'Starting Application Execution'
-   #sys.stdout.flush()
-
-   todays_date = datetime.datetime.now()
-   print todays_date
-
-   #####################################################
-   # Clean up working space
-   #####################################################
-   if "sample_dataset.h5part" in os.listdir(SCRATCH):
-      os.remove(SCRATCH + '/sample_dataset.h5part')
-   if "vorpalio.h5" in os.listdir(SCRATCH):
-      os.remove(SCRATCH + '/vorpalio.h5')
-   if "prs.h5" in os.listdir(SCRATCH):
-      os.remove(SCRATCH + '/prs.h5')
-
-   signal.signal(signal.SIGALRM, alarm_handler)
-   signal.alarm(59*60)  # 59 minutes
-
-   #################################
-   # SIZE OF THE OUTPUT FILE OF
-   #################################
-   VPIC_128 = 32000000
-   VORPAL_128 = 34000000
-   GCRM_128 = 30000000
-   VPIC_512 = 120000000
-   VORPAL_512 = 120000000
-   GCRM_512 = 120000000
-   VPIC_4096 = 1000000000
-
-   try:
-       valid = 0;
-       start = 0.0;
-       elapsed = 0.0;
-       for i in range(5):
-           start = time.time()
-
-           # print 'start time: ', start
-           # VPIC RUN
-           #q = subprocess.Popen(['ibrun /work/01657/bbehza2/HDF/VPIC/vpicbench_uni/vpicio_uni /scratch/01657/bbehza2/sample_dataset.h5part', "-np", "512"], stdout=subprocess.PIPE, shell=True)
-
-           # VORPAL RUN
-           # q = subprocess.Popen(["ibrun $WORK/HDF/VORPALIO/vorpalio/vorpalio -b 100 100 60 -n 8 8 8 -t 20 -o '/scratch/01657/bbehza2'", "-np", "512"], stdout=subprocess.PIPE, shell=True)
-
-           # GCRM RUN
-           #q = subprocess.Popen(["ibrun $WORK/HDF/GCRM/gcrmio/gcrmio -r 11 -s 7 -prs -t 10 -o '/scratch/01657/bbehza2'", "-np", "128"], stdout=subprocess.PIPE, shell=True)
-           #q = subprocess.Popen(["ibrun $WORK/HDF/GCRM/gcrmio/gcrmio -r 11 -s 7 -prs -t 40 -o '/scratch/01657/bbehza2'", "-np", "512"], stdout=subprocess.PIPE, shell=True)
-
-           q = subprocess.Popen(["$SCRATCH/h5_write", "rm SDS.h5"], stdout=subprocess.PIPE, shell=True)
-           out, err = q.communicate()
-           print out
-
-           elapsed = (time.time() - start)
-           print 'elapsed time; ', elapsed
-
-           ####################################################################
-           # Monitor size of output
-           ####################################################################
-
-           #if "sample_dataset.h5part" in os.listdir(SCRATCH):
-           #    if os.path.getsize(SCRATCH + '/sample_dataset.h5part') > VPIC_512:
-           #        valid = 1;
-           #        break;
-           #if "vorpalio.h5" in os.listdir(SCRATCH):
-           #    if os.path.getsize(SCRATCH + '/vorpalio.h5') > VORPAL_512:
-           #        valid = 1;
-           #        break;
-           #if "prs.h5" in os.listdir(SCRATCH):
-           #   if os.path.getsize(SCRATCH + '/prs.h5') > GCRM_512:
-           #        valid = 1;
-           #        break;
-
-   except Alarm:
-       print 'Taking too long, returning\n'
-       return float(10000);
-
-   ################################################################
-   # Evolution settings results update
-   ################################################################
-
-   global NUM_POP, NUM_ELITE, GLOB_COUNT
-   this_gen = GLOB_COUNT / NUM_POP
-   GLOB_COUNT = GLOB_COUNT + 1
-   print 'Glog_count ', GLOB_COUNT
-   print 'this_gen', this_gen
-   print 'num pop',NUM_POP,'num elite',NUM_ELITE
-
-   str_result = str(this_gen) + ': ' + str(this_strp_fac) + ', ' + str(this_strp_unt) + ', ' + str(this_cb_nds) + ', ' + str(this_cb_buf_size) + ', ' + str(this_align_thresh) + ', ' + str(this_align) + ', ' + str(this_siv_buf_size) + ': ' + str(elapsed);
-
-   str_param = str(this_strp_fac) + ', ' + str(this_strp_unt) + ', ' + str(this_cb_nds) + ', ' + str(this_cb_buf_size) + ', ' + str(this_align_thresh) + ', ' + str(this_align) + ', ' + str(this_siv_buf_size);
-
-   config_feat_file.write(str_param);
-   config_feat_file.write('\n');
-
-   result_output.write(str_result);
-   result_output.write('\n');
-   running_time_file.write('[' + str(todays_date) + '] ' + str_result + '=' + str(valid) + '\n');
-
-   sys.stdout.flush()
-   result_output.flush()
-   config_feat_file.flush()
-   running_time_file.flush()
-   perf_feat_filenames_file.flush()
-
-   return float(elapsed);
-
-def ConvergenceCriteria(ga_engine):
-   best = ga_engine.bestIndividual()
-   # Best Score of 128 cores is about 50 seconds
-   return best.score <= 40
-   # Best Score of 4096 cores is about 600 seconds
-   #return best.score <= 600
+CROSSOVER_RATE = 0.9        # pyevolve Consts.CDefGACrossoverRate
+MUTATION_RATE = 0.15        # ga.setMutationRate(0.15)
+SELECTION_PRESSURE = 1.2    # pyevolve Consts.CDefScaleLinearMultiplier
 
 
-def run_main():
-   print "Starting main()!"
-   #sys.stdout.flush()
-   global NUM_GENS, NUM_POP, NUM_ELITE, GLOB_COUNT, NO_OF_PARAMS
-   setOfAlleles = GAllele.GAlleles()
-   sf = GAllele.GAlleleList(strp_fac)
-   su = GAllele.GAlleleList(strp_unt)
-   cn = GAllele.GAlleleList(cb_nds)
-   # cs = GAllele.GAlleleList(cb_buf_size)
-   al = GAllele.GAlleleList(alignment)
-   sb = GAllele.GAlleleList(siv_buf_size)
-   setOfAlleles.add(sf)
-   setOfAlleles.add(su)
-   setOfAlleles.add(cn)
-   # setOfAlleles.add(cs)
-   setOfAlleles.add(al)
-   setOfAlleles.add(sb)
+def random_genome(alleles, rng):
+    return tuple(rng.choice(a) for a in alleles)
 
-   genome = G1DList.G1DList(NO_OF_PARAMS)
-   genome.setParams(allele=setOfAlleles)
 
-   genome.evaluator.set(eval_func)
-   genome.mutator.set(Mutators.G1DListMutatorAllele)
-   genome.initializator.set(Initializators.G1DListInitializatorAllele)
+def mutate(genome, alleles, rng, rate=MUTATION_RATE):
+    """Replace each gene with another of its alleles with probability `rate`."""
+    genes = list(genome)
+    for i, allele in enumerate(alleles):
+        if rng.random() < rate:
+            genes[i] = rng.choice(allele)
+    return tuple(genes)
 
-   ga = GSimpleGA.GSimpleGA(genome)
-   ga.selector.set(Selectors.GRouletteWheel)
-   ga.setMutationRate(0.15);
-   ga.setGenerations(NUM_GENS)
-   #ga.terminationCriteria.set(ConvergenceCriteria)
-   ga.setPopulationSize(NUM_POP)
-   ga.setMinimax(Consts.minimaxType["minimize"])
-   ga.setElitism(True)
-   ga.setElitismReplacement(NUM_ELITE)
-   print 'ga.evolve'
-   ga.evolve(freq_stats=1)
-   print 'closing result'
-   result_output.close()
-   print 'Best solution'
-   print ga.bestIndividual()
 
-if __name__ == "__main__":
-   run_main();
+def single_point(mom, dad, rng):
+    """Single-point crossover; returns both children."""
+    cut = rng.randint(1, len(mom) - 1)
+    return mom[:cut] + dad[cut:], dad[:cut] + mom[cut:]
+
+
+def roulette(scored, rng):
+    """Roulette-wheel pick from [(genome, score), ...].  Lower score is better.
+
+    Weights are linearly scaled so the best individual's share is
+    SELECTION_PRESSURE times the worst individual's, which keeps the worst
+    candidate reachable instead of zeroing it out.
+    """
+    best = min(score for _, score in scored)
+    worst = max(score for _, score in scored)
+    spread = worst - best
+    if spread <= 0.0:                       # whole population tied
+        return rng.choice(scored)[0]
+    floor = spread / (SELECTION_PRESSURE - 1.0)
+    weights = [(worst - score) + floor for _, score in scored]
+    target = rng.uniform(0.0, sum(weights))
+    running = 0.0
+    for (genome, _), weight in zip(scored, weights):
+        running += weight
+        if running >= target:
+            return genome
+    return scored[-1][0]                    # float rounding fallback
+
+
+def next_population(scored, alleles, pop_size, rng):
+    children = []
+    while len(children) + 1 < pop_size:
+        mom = roulette(scored, rng)
+        dad = roulette(scored, rng)
+        if rng.random() < CROSSOVER_RATE:
+            sister, brother = single_point(mom, dad, rng)
+        else:
+            sister, brother = mom, dad
+        children.append(mutate(sister, alleles, rng))
+        children.append(mutate(brother, alleles, rng))
+    if len(children) < pop_size:            # odd population size
+        children.append(mutate(roulette(scored, rng), alleles, rng))
+    return children[:pop_size]
+
+
+def evolve(alleles, evaluate, pop_size, generations, num_elite, rng,
+           on_generation=None):
+    """Run the search; return the best (genome, score) found."""
+    population = [random_genome(alleles, rng) for _ in range(pop_size)]
+    scored = []
+    for generation in range(generations):
+        previous, scored = scored, []
+        for genome in population:
+            scored.append((genome, evaluate(genome, generation)))
+        scored.sort(key=lambda pair: pair[1])
+        # Elitism: carry the previous generation's best individuals over this
+        # generation's worst, but only where they are actually better.
+        for i in range(min(num_elite, len(previous))):
+            if previous[i][1] < scored[-1][1]:
+                scored[-1] = previous[i]
+                scored.sort(key=lambda pair: pair[1])
+        if on_generation is not None:
+            on_generation(generation, scored)
+        if generation < generations - 1:
+            population = next_population(scored, alleles, pop_size, rng)
+    return scored[0]
+
+
+# ---------------------------------------------------------------------------
+# Candidate -> config.xml
+# ---------------------------------------------------------------------------
+
+def decode(genome):
+    """Turn a genome into the parameter values written to config.xml."""
+    threshold, align = (int(part.strip())
+                        for part in genome[GENE_ALIGN].split(','))
+    return {
+        'striping_factor': genome[GENE_STRP_FAC],
+        'striping_unit': genome[GENE_STRP_UNT],
+        'cb_nodes': genome[GENE_CB_NDS],
+        # Tied to striping_unit rather than searched independently, preserved
+        # from the original ("Ruth(David's) Suggestion").
+        'cb_buffer_size': genome[GENE_STRP_UNT],
+        'align_threshold': threshold,
+        'alignment': align,
+        'sieve_buf_size': genome[GENE_SIV_BUF],
+    }
+
+
+def build_config_xml(params):
+    """Render params as an H5Tuner config document.
+
+    The section elements are documentation only: H5Tuner searches the whole
+    tree by tag name and ignores this nesting.
+    """
+    doc = Document()
+    root = doc.createElement('Parameters')
+    doc.appendChild(root)
+
+    def section(name):
+        node = doc.createElement(name)
+        root.appendChild(node)
+        return node
+
+    def setting(parent, name, value):
+        node = doc.createElement(name)
+        parent.appendChild(node)
+        node.appendChild(doc.createTextNode(str(value)))
+
+    high = section('High_Level_IO_Library')
+    setting(high, 'alignment',
+            '{0},{1}'.format(params['align_threshold'], params['alignment']))
+    setting(high, 'sieve_buf_size', params['sieve_buf_size'])
+
+    middle = section('Middleware_Layer')
+    setting(middle, 'cb_nodes', params['cb_nodes'])
+    setting(middle, 'cb_buffer_size', params['cb_buffer_size'])
+
+    low = section('Parallel_File_System')
+    setting(low, 'striping_factor', params['striping_factor'])
+    setting(low, 'striping_unit', params['striping_unit'])
+
+    return doc.toprettyxml(indent='  ')
+
+
+def write_config(params, directory):
+    """Write config.xml where the application will look for it.
+
+    H5Tuner opens a bare relative "config.xml", so it must land in the working
+    directory the application inherits -- ours.
+    """
+    path = os.path.join(directory, CONFIG_FILENAME)
+    with open(path, 'w') as handle:
+        handle.write(build_config_xml(params))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Measurement
+# ---------------------------------------------------------------------------
+
+class Timeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise Timeout
+
+
+def cleanup_outputs(directory):
+    for name in CLEANUP_FILES:
+        path = os.path.join(directory, name)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def measure(app_cmd, reps, timeout_seconds):
+    """Launch the application `reps` times.
+
+    Returns (times, ok, output).  `times` is None if the candidate exceeded
+    timeout_seconds; `ok` is True when every launch exited zero.
+    """
+    times = []
+    ok = True
+    output = ''
+    running = None
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout_seconds)
+    try:
+        for _ in range(reps):
+            start = time.time()
+            running = subprocess.Popen(app_cmd, shell=True,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
+            raw, _unused = running.communicate()
+            times.append(time.time() - start)
+            output = raw.decode('utf-8', 'replace')
+            if running.returncode != 0:
+                ok = False
+            running = None
+    except Timeout:
+        if running is not None and running.poll() is None:
+            running.kill()
+            running.wait()
+        return None, False, output
+    finally:
+        signal.alarm(0)
+    return times, ok, output
+
+
+def synthetic_cost(params):
+    """A fake, deterministic runtime for --dry-run.
+
+    This is a smooth landscape with one broad optimum so the search visibly
+    converges without launching anything.  It is not a performance model and
+    says nothing about real I/O behaviour.
+    """
+    def distance(value, ideal):
+        return abs(math.log2(value / float(ideal)))
+
+    stripes = params['striping_factor']
+    if stripes < 0:                         # -1 means "all OSTs"
+        stripes = 64
+    return (60.0
+            + 4.0 * distance(stripes, 32)
+            + 3.0 * distance(params['striping_unit'], 4194304)
+            + 2.0 * distance(params['cb_nodes'], 32)
+            + 1.5 * distance(max(params['alignment'], 1), 65536))
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--app-cmd', default=os.environ.get(
+        'H5TUNER_APP_CMD', DEFAULT_APP_CMD),
+        help='shell command that runs the application under test '
+             '(default: %(default)s)')
+    parser.add_argument('--population', type=int, default=NUM_POP,
+                        help='individuals per generation (default: %(default)s)')
+    parser.add_argument('--generations', type=int, default=NUM_GENS,
+                        help='number of generations (default: %(default)s)')
+    parser.add_argument('--elite', type=int, default=NUM_ELITE,
+                        help='individuals carried over unchanged '
+                             '(default: %(default)s)')
+    parser.add_argument('--reps', type=int, default=REPS,
+                        help='measurements per candidate; fitness is the '
+                             'fastest (default: %(default)s)')
+    parser.add_argument('--timeout', type=int, default=TIMEOUT_SECONDS,
+                        help='per-candidate budget in seconds '
+                             '(default: %(default)s)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='seed the RNG for a reproducible search')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='re-measure repeated configurations instead of '
+                             'reusing their recorded time')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='exercise the search and the XML writer with a '
+                             'synthetic cost function, launching nothing')
+    return parser.parse_args(argv)
+
+
+def run_main(argv=None):
+    args = parse_args(argv)
+    workdir = os.getcwd()
+    scratch = os.environ.setdefault('SCRATCH', workdir)
+
+    if not args.dry_run:
+        preload = os.environ.get('LD_PRELOAD', '')
+        if 'autotuner' not in preload:
+            print('WARNING: LD_PRELOAD does not mention autotuner '
+                  '({0!r}).'.format(preload), file=sys.stderr)
+            print('         The application will run untuned and every '
+                  'candidate will score the same.', file=sys.stderr)
+
+    total = args.population * args.generations * args.reps
+    print('h5evolve: {0} generations x {1} individuals x {2} reps '
+          '= up to {3} app launches'.format(
+              args.generations, args.population, args.reps, total))
+    print('h5evolve: config written to {0}'.format(
+        os.path.join(workdir, CONFIG_FILENAME)))
+    if args.dry_run:
+        print('h5evolve: DRY RUN -- synthetic cost, no application launched')
+    else:
+        print('h5evolve: app command: {0}'.format(args.app_cmd))
+        print('h5evolve: SCRATCH={0}'.format(scratch))
+
+    rng = random.Random(args.seed)
+    cache = {}
+    launches = 0
+
+    result_output = open('./result_output.txt', 'w')
+    config_feat_file = open('./config_feat.txt', 'w')
+    running_time_file = open('./running_time.txt', 'w')
+
+    def evaluate(genome, generation):
+        nonlocal launches
+        params = decode(genome)
+        summary = ('{striping_factor}, {striping_unit}, {cb_nodes}, '
+                   '{cb_buffer_size}, {align_threshold}, {alignment}, '
+                   '{sieve_buf_size}').format(**params)
+
+        if not args.no_cache and genome in cache:
+            return cache[genome]
+
+        write_config(params, workdir)
+        print('Evaluating ({0})'.format(summary))
+        sys.stdout.flush()
+
+        stamp = datetime.datetime.now()
+        if args.dry_run:
+            elapsed = synthetic_cost(params)
+            ok = True
+        else:
+            cleanup_outputs(scratch)
+            times, ok, output = measure(args.app_cmd, args.reps, args.timeout)
+            launches += args.reps
+            if times is None:
+                print('  timed out after {0}s, penalising'.format(args.timeout))
+                elapsed = TIMEOUT_PENALTY
+            else:
+                elapsed = min(times)
+                print('  times: {0}  -> {1:.3f}s'.format(
+                    ', '.join('{0:.3f}'.format(t) for t in times), elapsed))
+                if output.strip():
+                    print(output.rstrip())
+            if not ok:
+                print('  WARNING: application exited non-zero')
+
+        record = '{0}: {1}: {2}'.format(generation, summary, elapsed)
+        config_feat_file.write(summary + '\n')
+        result_output.write(record + '\n')
+        running_time_file.write('[{0}] {1}={2}\n'.format(
+            stamp, record, 1 if ok else 0))
+        for handle in (config_feat_file, result_output, running_time_file):
+            handle.flush()
+        sys.stdout.flush()
+
+        cache[genome] = elapsed
+        return elapsed
+
+    def report(generation, scored):
+        best_genome, best_score = scored[0]
+        average = sum(score for _, score in scored) / len(scored)
+        print('--- generation {0}: best {1:.3f}  avg {2:.3f}  '
+              'evaluated {3} configs'.format(
+                  generation, best_score, average, len(cache)))
+        print('    best config: {0}'.format(
+            ', '.join('{0}={1}'.format(k, v)
+                      for k, v in sorted(decode(best_genome).items()))))
+        sys.stdout.flush()
+
+    try:
+        best_genome, best_score = evolve(
+            ALLELES, evaluate,
+            pop_size=args.population,
+            generations=args.generations,
+            num_elite=args.elite,
+            rng=rng,
+            on_generation=report)
+    finally:
+        for handle in (result_output, config_feat_file, running_time_file):
+            handle.close()
+
+    print('')
+    print('Best solution: {0:.3f}s'.format(best_score))
+    for key, value in sorted(decode(best_genome).items()):
+        print('  {0} = {1}'.format(key, value))
+    print('Distinct configurations evaluated: {0}'.format(len(cache)))
+    if not args.dry_run:
+        print('Application launches: {0}'.format(launches))
+
+    # Leave the winning configuration in place for the next run.
+    write_config(decode(best_genome), workdir)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(run_main())
