@@ -20,7 +20,8 @@ TEST_PROG=test_collective_write_01_threshold \
 	  test_independent_write_04_striping_factor \
 	  test_independent_write_05_striping_unit \
 	  test_independent_write_06_cb_buffer_size \
-	  test_independent_write_07_cb_nodes
+	  test_independent_write_07_cb_nodes \
+	  test_hdf5_metadata_params
 
 
 check_PROGRAMS=$(TEST_PROG)

@@ -4,6 +4,15 @@
 		<sieve_buf_size>77</sieve_buf_size>
 		<alignment>88,44</alignment>
 		<!-- H5Pset_alignment function gets 2 args: (Threshold, Alignment) -->
+
+		<!-- Added 2026-08-13, checked by test_hdf5_metadata_params.c.
+		     mdc_conf is deliberately not "default" so the preset path is
+		     exercised rather than the no-op branch. -->
+		<meta_block_size>262144</meta_block_size>
+		<chunk_cache>16777216</chunk_cache>
+		<coll_metadata_write>1</coll_metadata_write>
+		<col_meta_ops>1</col_meta_ops>
+		<mdc_conf>aggressive</mdc_conf>
 	</High_Level_IO_Library>
 
 	<Middleware_Layer>

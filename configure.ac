@@ -109,11 +109,31 @@ AC_MSG_RESULT([done])
 AM_CFLAGS="-I . -I${MPIROOT}/include -I${MXMLROOT}/include -I${HDF5ROOT}/include"
 AM_CFLAGS_SHARED="-I . -I${MPIROOT}/include -I${MXMLROOT}/include -I${HDF5ROOT}/include -g -shared -fpic -DPIC"
 AM_LDFLAGS=
-AM_LDFLAGS_SHARED=-ldl
+## The shim is loaded through LD_PRELOAD, which happens BEFORE the application
+## and its own libraries are mapped.  Without an rpath the loader cannot
+## resolve the HDF5 symbols the shim references, and LD_PRELOAD then drops the
+## library -- silently.  Every candidate runs untuned and nothing reports an
+## error.  Baking the paths in removes the dependence on LD_LIBRARY_PATH
+## reaching the compute node, which MPI launchers do not always arrange.
+AM_LDFLAGS_SHARED="-ldl -Wl,-rpath,${HDF5ROOT}/lib -Wl,-rpath,${MXMLROOT}/lib" 
 
 AM_MXML_LIB="-L${MXMLROOT}/lib/ -lmxml"
 AM_HDF5_LIB="-L${HDF5ROOT}/lib -lhdf5"
-AM_MPI_LIB="-L${MPIROOT}/lib -lmpich"
+## MPI library name.  The original hardcoded -lmpich, which fails to link on
+## any site running Open MPI or Intel MPI -- both ship libmpi, not libmpich.
+## Detected rather than configured so an existing invocation keeps working.
+AM_MPI_LIB_NAME=mpich
+for at_mpi_dir in "${MPIROOT}/lib" "${MPIROOT}/lib64"; do
+  if test -f "${at_mpi_dir}/libmpi.so" || test -f "${at_mpi_dir}/libmpi.a"; then
+    AM_MPI_LIB_NAME=mpi
+    break
+  elif test -f "${at_mpi_dir}/libmpich.so" || test -f "${at_mpi_dir}/libmpich.a"; then
+    AM_MPI_LIB_NAME=mpich
+    break
+  fi
+done
+AC_MSG_NOTICE([using MPI library -l${AM_MPI_LIB_NAME}])
+AM_MPI_LIB="-L${MPIROOT}/lib -l${AM_MPI_LIB_NAME}"
 
 AM_ADDFLAGS=-DDEBUG
 AM_ADDFLAGS_SHARED=-DDEBUG

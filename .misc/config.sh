@@ -21,7 +21,15 @@ then
         mkdir -p $AT_PREFIX/opt
 fi
 
-HDF5_V="hdf5-1.8.12"
+# HDF5 1.14.1-2 is what the target cluster has installed (parallel ON,
+# Fortran/C++ bindings OFF).  The version matters to src/autotuner_hdf5.c:
+# H5Pset_coll_metadata_write and H5Pset_all_coll_metadata_ops arrived in
+# 1.10.0, and the shim compiles them out below that with a runtime warning.
+HDF5_V="hdf5-1.14.1-2"
+# Upstream release tarballs use underscores in the version, directories use dots.
+HDF5_TAG="hdf5-1_14_1-2"
+HDF5_SERIES="hdf5-1.14"
+HDF5_POINT="hdf5-1.14.1"
 ZLIB_V="zlib-1.2.8"
 MXML_V="mxml-2.9"
 NCDF4_V="v4.4.0"
@@ -37,7 +45,9 @@ then
         echo "Creating ${MXMLDIR} and Building Mini-XML"
         echo "--";
 
-        wget http://www.msweet.org/files/project3/$MXML_V.tar.gz
+        # msweet.org no longer serves project3.  VERIFY before relying on this.
+        wget https://github.com/michaelrsweet/mxml/releases/download/release-2.9/$MXML_V.tar.gz \
+            || wget http://www.msweet.org/files/project3/$MXML_V.tar.gz
         tar xvzf $MXML_V.tar.gz
         cd $MXMLDIR
             ./configure --prefix=${AT_PREFIX}/opt/${MXML_V} --enable-shared
@@ -76,8 +86,16 @@ then
         echo "Creating ${HDF5DIR} and Building HDF5"
         echo "--";
 
-        wget http://www.hdfgroup.org/ftp/HDF5/releases/${HDF5_V}/src/${HDF5_V}.tar.gz
-        tar xvzf ${HDF5_V}.tar.gz
+        # The hdfgroup.org FTP layout this script was written against is gone.
+        # Try the GitHub release first, then the support site.  VERIFY THESE
+        # URLS before relying on the bootstrap -- they have moved twice already.
+        wget https://github.com/HDFGroup/hdf5/releases/download/${HDF5_TAG}/${HDF5_TAG}.tar.gz \
+            || wget https://support.hdfgroup.org/ftp/HDF5/releases/${HDF5_SERIES}/${HDF5_POINT}/src/${HDF5_V}.tar.gz
+        if [ -f "${HDF5_TAG}.tar.gz" ]; then
+            tar xvzf ${HDF5_TAG}.tar.gz
+        else
+            tar xvzf ${HDF5_V}.tar.gz
+        fi
 
         cd ${HDF5DIR}
             if [ -z "$MPIROOT" ]; then
@@ -92,7 +110,7 @@ then
             make && make install
         cd ..
         # Remove downloaded file
-        rm -f "${HDF5_V}.tar.gz"
+        rm -f "${HDF5_V}.tar.gz" "${HDF5_TAG}.tar.gz"
 else
         echo "--";
         echo "A directory " $HDF5DIR " already exists.";
@@ -122,6 +140,10 @@ then
         cd ..
         # Remove downloaded file
         rm -f "${NCDF4_V}.tar.gz"
+# Pre-existing bug: this fi was missing, so the else at the bottom of the script
+# attached to the NetCDF4 block instead of the mpicc check at the top and the
+# whole file failed `bash -n`.  It has never been syntactically valid.
+fi
 
 
 # checking for mpich -- continuing from the top of the script

@@ -3,6 +3,19 @@
 	<High_Level_IO_Library>
 		<alignment> 1048576, 8388608 </alignment>
 		<chunk> 1,1,2621440 </chunk>
+		<!-- Added 2026-08-13.  All five reach fapl_id through
+		     set_hdf5_parameter() in src/autotuner_hdf5.c. -->
+		<meta_block_size>262144</meta_block_size>
+		<!-- H5Pset_cache: only rdcc_nbytes is tuned; the slot count and the
+		     preemption policy keep whatever the property list already holds. -->
+		<chunk_cache>16777216</chunk_cache>
+		<!-- The next two need HDF5 1.10.0 or later.  On an older build the shim
+		     warns and skips them rather than failing to compile. -->
+		<coll_metadata_write>1</coll_metadata_write>
+		<col_meta_ops>1</col_meta_ops>
+		<!-- Named preset, not the full H5AC_cache_config_t struct.
+		     One of: default, aggressive, conservative. -->
+		<mdc_conf>default</mdc_conf>
 	</High_Level_IO_Library>
 
 	<Middleware_Layer>
